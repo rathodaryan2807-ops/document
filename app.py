@@ -124,7 +124,7 @@ Document context:
 
 Give a clear answer followed by a short Evidence section with page citations."""
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.8-flash",
                     contents=prompt,
                 )
                 answer = getattr(response, "text", None)
