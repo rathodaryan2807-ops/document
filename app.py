@@ -23,7 +23,7 @@ except ImportError:
 
 st.set_page_config(page_title="DocMind AI", page_icon="📚", layout="wide")
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 st.markdown("""
 <style>
