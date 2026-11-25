@@ -1,8 +1,9 @@
 import io
 import os
 import re
+import time
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import streamlit as st
 from pypdf import PdfReader
@@ -11,10 +12,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 try:
     from google import genai
-    from google.genai import types
 except ImportError:
     genai = None
-    types = None
 
 try:
     import fitz  # PyMuPDF: render scanned PDF pages for Gemini-based OCR
@@ -23,7 +22,7 @@ except ImportError:
 
 st.set_page_config(page_title="DocMind AI", page_icon="📚", layout="wide")
 
-MODEL_NAME = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 st.markdown("""
 <style>
@@ -35,23 +34,47 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">📚 DocMind AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Your AI-powered document research assistant — upload, ask, compare, summarize, and learn.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Your AI-powered document research assistant — upload, ask, compare, summarize, and learn.</div>',
+    unsafe_allow_html=True,
+)
 
-with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input(
-        "Google Gemini API key",
-        type="password",
-        value=st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", "")),
-        help="Create a key at https://aistudio.google.com/apikey. Keep it private.",
-    )
-    st.caption(f"Gemini model: `{MODEL_NAME}`")
-    st.divider()
-    st.markdown("**Features**")
-    st.markdown("• Multiple PDF upload\n• Document comparison\n• Chat history\n• Smart summaries\n• MCQ quiz generator\n• Page citations\n• PDF/Word export\n• Scanned PDF OCR")
-    if st.button("🗑️ Clear chat history", use_container_width=True):
-        st.session_state.chat_history = []
-        st.rerun()
+
+def get_default_api_key() -> str:
+    """Safely read GEMINI_API_KEY from Streamlit secrets or environment variables."""
+    try:
+        return st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    except Exception:
+        return os.getenv("GEMINI_API_KEY", "")
+
+
+def is_transient_503(exc: Exception) -> bool:
+    """Return True if an exception indicates a temporary Gemini backend overload (503/504)."""
+    code = getattr(exc, "code", None)
+    text = str(exc)
+    return code in (503, 504) or "503" in text or "UNAVAILABLE" in text
+
+
+def fetch_available_models(key: str) -> List[str]:
+    """Verify the Google AI Studio API key and list available generateContent models."""
+    if genai is None:
+        raise RuntimeError("Google GenAI package is missing. Install requirements.txt.")
+    test_client = genai.Client(api_key=key)
+    models = []
+    for model in test_client.models.list():
+        actions = getattr(model, "supported_actions", None) or []
+        if "generateContent" in actions and getattr(model, "name", None):
+            clean_name = model.name.removeprefix("models/")
+            if clean_name.startswith("gemini"):
+                models.append(clean_name)
+    unique = sorted(set(models))
+    if DEFAULT_MODEL in unique:
+        unique.remove(DEFAULT_MODEL)
+        unique.insert(0, DEFAULT_MODEL)
+    elif not unique:
+        unique = [DEFAULT_MODEL]
+    return unique
+
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -59,6 +82,77 @@ if "doc_chunks" not in st.session_state:
     st.session_state.doc_chunks = []
 if "doc_names" not in st.session_state:
     st.session_state.doc_names = []
+if "available_models" not in st.session_state:
+    st.session_state.available_models = [DEFAULT_MODEL]
+if "key_status" not in st.session_state:
+    st.session_state.key_status = None
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = st.text_input(
+        "Google Gemini API key",
+        type="password",
+        value=get_default_api_key(),
+        help="Create a key at https://aistudio.google.com/apikey. Keep it private.",
+    )
+
+    if st.button("🔑 Check API key & load models", use_container_width=True):
+        if not api_key:
+            st.session_state.key_status = ("warning", "Enter your Google AI Studio API key first.")
+        else:
+            try:
+                loaded_models = fetch_available_models(api_key)
+                st.session_state.available_models = loaded_models
+                st.session_state.key_status = (
+                    "success",
+                    f"API key is valid! Found {len(loaded_models)} Gemini model(s).",
+                )
+            except Exception as exc:
+                if is_transient_503(exc):
+                    st.session_state.key_status = (
+                        "warning",
+                        "API key reached Google, but Google's servers returned 503 UNAVAILABLE (temporary high demand). Try again shortly.",
+                    )
+                else:
+                    st.session_state.key_status = ("error", f"API key check failed: {exc}")
+
+    if st.session_state.key_status:
+        level, msg = st.session_state.key_status
+        getattr(st, level)(msg)
+
+    selected_model = st.selectbox(
+        "Primary Gemini model",
+        options=st.session_state.available_models,
+        index=0,
+        help="Click 'Check API key & load models' to list all Gemini models enabled on your key.",
+    )
+
+    fallback_options = ["None"] + [m for m in st.session_state.available_models if m != selected_model]
+    fallback_choice = st.selectbox(
+        "Fallback model (on 503 error)",
+        options=fallback_options,
+        index=0,
+        help="Optional backup model used automatically if the primary model stays overloaded (503).",
+    )
+    fallback_model = None if fallback_choice == "None" else fallback_choice
+    st.caption(f"Active model: `{selected_model}`")
+
+    st.divider()
+    st.markdown("**Features**")
+    st.markdown(
+        "• Multiple PDF upload\n"
+        "• Document comparison\n"
+        "• Chat history\n"
+        "• Smart summaries\n"
+        "• MCQ quiz generator\n"
+        "• Page citations\n"
+        "• PDF/Word export\n"
+        "• Scanned PDF OCR"
+    )
+    if st.button("🗑️ Clear chat history", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+
 
 def gemini_client():
     if not api_key:
@@ -67,18 +161,46 @@ def gemini_client():
         raise RuntimeError("Google GenAI package is missing. Install requirements.txt.")
     return genai.Client(api_key=api_key)
 
+
+def _call_model_with_retry(client, model_name: str, contents: List[Any], max_retries: int = 3) -> str:
+    delay = 2
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=model_name, contents=contents)
+            result = getattr(response, "text", None)
+            if not result:
+                raise RuntimeError("Gemini returned an empty response.")
+            return result.strip()
+        except Exception as exc:
+            if is_transient_503(exc) and attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+
+
 def ask_gemini(prompt: str, images=None) -> str:
+    """Call Gemini with exponential-backoff retries on 503 and optional fallback model."""
     client = gemini_client()
     if client is None:
         raise RuntimeError("Add your Google Gemini API key in the sidebar or Streamlit secrets.")
-    contents = [prompt]
+
+    contents: List[Any] = [prompt]
     if images:
         contents.extend(images)
-    response = client.models.generate_content(model=MODEL_NAME, contents=contents)
-    result = getattr(response, "text", None)
-    if not result:
-        raise RuntimeError("Gemini returned an empty response.")
-    return result.strip()
+
+    try:
+        return _call_model_with_retry(client, selected_model, contents)
+    except Exception as exc:
+        if is_transient_503(exc) and fallback_model:
+            return _call_model_with_retry(client, fallback_model, contents)
+        if is_transient_503(exc):
+            raise RuntimeError(
+                f"{exc} — Your API key is valid, but `{selected_model}` is temporarily overloaded on Google's side. "
+                "Wait a moment and retry, or click 'Check API key & load models' in the sidebar to switch/add a fallback model."
+            ) from exc
+        raise
+
 
 def extract_pdf_pages(uploaded_file, allow_ocr: bool) -> List[Dict[str, Any]]:
     raw = uploaded_file.getvalue()
@@ -103,13 +225,14 @@ def extract_pdf_pages(uploaded_file, allow_ocr: bool) -> List[Dict[str, Any]]:
             st.warning("Scanned PDF OCR requires PyMuPDF. Check requirements.txt.")
             return pages
         try:
+            from PIL import Image
+
             doc = fitz.open(stream=raw, filetype="pdf")
             max_pages = min(len(doc), 30)
             st.info(f"Using Gemini OCR for {filename} ({max_pages} pages max). This may use API quota.")
             progress = st.progress(0, text=f"OCR: {filename}")
             for i in range(max_pages):
                 pix = doc.load_page(i).get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
-                from PIL import Image
                 image = Image.open(io.BytesIO(pix.tobytes("png")))
                 prompt = (
                     "Transcribe all readable text in this document page as faithfully as possible. "
@@ -119,12 +242,13 @@ def extract_pdf_pages(uploaded_file, allow_ocr: bool) -> List[Dict[str, Any]]:
                 text = ask_gemini(prompt, images=[image])
                 if text.strip():
                     pages.append({"file": filename, "page": i + 1, "text": text.strip(), "ocr": True})
-                progress.progress((i + 1) / max_pages, text=f"OCR page {i+1}/{max_pages}")
+                progress.progress((i + 1) / max_pages, text=f"OCR page {i + 1}/{max_pages}")
             progress.empty()
             doc.close()
         except Exception as exc:
             st.warning(f"Gemini OCR failed for {filename}: {exc}")
     return pages
+
 
 def split_pages_into_chunks(pages: List[Dict[str, Any]], chunk_size: int = 1400, overlap: int = 180):
     chunks = []
@@ -136,13 +260,16 @@ def split_pages_into_chunks(pages: List[Dict[str, Any]], chunk_size: int = 1400,
         while start < len(text):
             end = min(len(text), start + chunk_size)
             chunks.append({
-                "file": p["file"], "page": p["page"], "text": text[start:end],
-                "ocr": p.get("ocr", False)
+                "file": p["file"],
+                "page": p["page"],
+                "text": text[start:end],
+                "ocr": p.get("ocr", False),
             })
             if end >= len(text):
                 break
             start = max(end - overlap, start + 1)
     return chunks
+
 
 def retrieve(question: str, chunks: List[Dict[str, Any]], top_k: int = 5):
     if not chunks:
@@ -157,6 +284,7 @@ def retrieve(question: str, chunks: List[Dict[str, Any]], top_k: int = 5):
     except ValueError:
         return []
 
+
 def format_sources(sources):
     if not sources:
         return "No matching source passages were found."
@@ -165,6 +293,7 @@ def format_sources(sources):
         marker = " (OCR)" if s.get("ocr") else ""
         out.append(f"[{s['file']}, page {s['page']}{marker}]\n{s['text']}")
     return "\n\n".join(out)
+
 
 def generate_answer(question, sources):
     context = format_sources(sources)
@@ -181,13 +310,15 @@ USER QUESTION:
 """
     return ask_gemini(prompt)
 
+
 def create_report_pdf(title: str, body: str, sources: List[Dict[str, Any]]):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.lib import colors
     from xml.sax.saxutils import escape
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=42, leftMargin=42, topMargin=48, bottomMargin=42)
@@ -208,9 +339,10 @@ def create_report_pdf(title: str, body: str, sources: List[Dict[str, Any]]):
     doc.build(story)
     return buffer.getvalue()
 
+
 def create_report_docx(title: str, body: str, sources: List[Dict[str, Any]]):
     from docx import Document
-    from docx.shared import Inches
+
     doc = Document()
     doc.add_heading(title, 0)
     doc.add_paragraph(f"Generated by DocMind AI on {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -225,6 +357,7 @@ def create_report_docx(title: str, body: str, sources: List[Dict[str, Any]]):
     buffer = io.BytesIO()
     doc.save(buffer)
     return buffer.getvalue()
+
 
 uploaded_files = st.file_uploader(
     "📄 Upload one or more PDF documents",
@@ -284,7 +417,11 @@ with tab_chat:
         with st.spinner("Searching documents and generating an answer..."):
             sources = retrieve(question.strip(), st.session_state.doc_chunks, top_k=6)
             try:
-                answer = generate_answer(question.strip(), sources) if api_key else "Gemini key not provided. Here are the most relevant passages instead:\n\n" + format_sources(sources)
+                answer = (
+                    generate_answer(question.strip(), sources)
+                    if api_key
+                    else "Gemini key not provided. Here are the most relevant passages instead:\n\n" + format_sources(sources)
+                )
             except Exception as exc:
                 answer = "Gemini answer generation failed; showing retrieved passages instead.\n\n" + format_sources(sources) + f"\n\n**Gemini error:** {exc}"
             st.session_state.chat_history.append({"role": "user", "content": question.strip(), "sources": []})
@@ -316,7 +453,7 @@ with tab_summary:
     if st.button("✨ Generate summary", type="primary"):
         chosen = st.session_state.doc_chunks if selected_summary_doc == "All uploaded PDFs" else [c for c in st.session_state.doc_chunks if c["file"] == selected_summary_doc]
         # Keep prompt manageable; spread chunks across the document so the summary covers more than the first pages.
-        sample = chosen if len(chosen) <= 18 else [chosen[i] for i in sorted(set(round(i*(len(chosen)-1)/17) for i in range(18)))]
+        sample = chosen if len(chosen) <= 18 else [chosen[i] for i in sorted(set(round(i * (len(chosen) - 1) / 17) for i in range(18)))]
         context = format_sources(sample)
         prompt = f"""Create a {summary_style.lower()} of the following document excerpts. Organize with headings and bullet points.
 Use only the provided text. Mention important definitions, claims, numbers, and conclusions. If excerpts are incomplete, state that this is a summary of sampled passages.
@@ -353,7 +490,7 @@ with tab_quiz:
     quiz_difficulty = st.selectbox("Difficulty", ["Mixed", "Easy", "Medium", "Hard"])
     if st.button("🧠 Generate quiz", type="primary"):
         chosen = st.session_state.doc_chunks if quiz_doc == "All uploaded PDFs" else [c for c in st.session_state.doc_chunks if c["file"] == quiz_doc]
-        sample = chosen if len(chosen) <= 14 else [chosen[i] for i in sorted(set(round(i*(len(chosen)-1)/13) for i in range(14)))]
+        sample = chosen if len(chosen) <= 14 else [chosen[i] for i in sorted(set(round(i * (len(chosen) - 1) / 13) for i in range(14)))]
         prompt = f"""Create exactly {quiz_count} multiple-choice questions at {quiz_difficulty.lower()} difficulty from the source excerpts.
 For each question provide four options A-D, one correct answer, and a one-sentence explanation with citation [filename, page N].
 Do not use information absent from the excerpts. Format each question clearly in Markdown and put the answer after the options.
@@ -386,8 +523,10 @@ with tab_compare:
         if st.button("⚖️ Compare documents", type="primary"):
             left_chunks = [c for c in st.session_state.doc_chunks if c["file"] == left_doc]
             right_chunks = [c for c in st.session_state.doc_chunks if c["file"] == right_doc]
+
             def sample_doc(chunks):
-                return chunks if len(chunks) <= 10 else [chunks[i] for i in sorted(set(round(i*(len(chunks)-1)/9) for i in range(10)))]
+                return chunks if len(chunks) <= 10 else [chunks[i] for i in sorted(set(round(i * (len(chunks) - 1) / 9) for i in range(10)))]
+
             prompt = f"""Compare these two documents fairly and clearly. Cover common themes, differences, contradictions if supported, and practical takeaways. Cite claims as [filename, page N]. Do not assume that a missing detail means it is false.
 Focus: {compare_focus or 'main ideas, evidence, conclusions, and differences'}
 
