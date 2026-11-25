@@ -86,53 +86,76 @@ if "available_models" not in st.session_state:
     st.session_state.available_models = [DEFAULT_MODEL]
 if "key_status" not in st.session_state:
     st.session_state.key_status = None
+if "models_initialized" not in st.session_state:
+    st.session_state.models_initialized = False
+
+api_key = get_default_api_key()
+
+if api_key and not st.session_state.models_initialized:
+    st.session_state.models_initialized = True
+    try:
+        loaded_models = fetch_available_models(api_key)
+        st.session_state.available_models = loaded_models
+        st.session_state.key_status = (
+            "success",
+            f"API connected! Found {len(loaded_models)} Gemini model(s).",
+        )
+    except Exception as exc:
+        if is_transient_503(exc):
+            st.session_state.key_status = (
+                "warning",
+                "API connected, but Google's servers returned 503 UNAVAILABLE (temporary high demand).",
+            )
+        else:
+            st.session_state.key_status = ("error", f"API key check failed: {exc}")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_key = st.text_input(
-        "Google Gemini API key",
-        type="password",
-        value=get_default_api_key(),
-        help="Create a key at https://aistudio.google.com/apikey. Keep it private.",
-    )
 
-    if st.button("🔑 Check API key & load models", use_container_width=True):
-        if not api_key:
-            st.session_state.key_status = ("warning", "Enter your Google AI Studio API key first.")
-        else:
+    if not api_key:
+        st.error("Gemini API key is not configured. Set `GEMINI_API_KEY` in `.streamlit/secrets.toml` or Streamlit Secrets.")
+    else:
+        if st.button("🔄 Refresh models & check API", use_container_width=True):
             try:
                 loaded_models = fetch_available_models(api_key)
                 st.session_state.available_models = loaded_models
                 st.session_state.key_status = (
                     "success",
-                    f"API key is valid! Found {len(loaded_models)} Gemini model(s).",
+                    f"API connected! Found {len(loaded_models)} Gemini model(s).",
                 )
             except Exception as exc:
                 if is_transient_503(exc):
                     st.session_state.key_status = (
                         "warning",
-                        "API key reached Google, but Google's servers returned 503 UNAVAILABLE (temporary high demand). Try again shortly.",
+                        "API connected, but Google's servers returned 503 UNAVAILABLE (temporary high demand). Try again shortly.",
                     )
                 else:
                     st.session_state.key_status = ("error", f"API key check failed: {exc}")
 
-    if st.session_state.key_status:
-        level, msg = st.session_state.key_status
-        getattr(st, level)(msg)
+        if st.session_state.key_status:
+            level, msg = st.session_state.key_status
+            getattr(st, level)(msg)
 
     selected_model = st.selectbox(
         "Primary Gemini model",
         options=st.session_state.available_models,
         index=0,
-        help="Click 'Check API key & load models' to list all Gemini models enabled on your key.",
+        help="Switch models if the primary model is experiencing high demand.",
     )
 
-    fallback_options = ["None"] + [m for m in st.session_state.available_models if m != selected_model]
+    other_models = [m for m in st.session_state.available_models if m != selected_model]
+    fallback_options = ["None"] + other_models
+    default_fallback_index = 0
+    if "gemini-3.7-flash" in other_models:
+        default_fallback_index = fallback_options.index("gemini-3.7-flash")
+    elif other_models:
+        default_fallback_index = 1
+
     fallback_choice = st.selectbox(
         "Fallback model (on 503 error)",
         options=fallback_options,
-        index=0,
-        help="Optional backup model used automatically if the primary model stays overloaded (503).",
+        index=default_fallback_index,
+        help="Backup model used automatically if the primary model stays overloaded (503).",
     )
     fallback_model = None if fallback_choice == "None" else fallback_choice
     st.caption(f"Active model: `{selected_model}`")
@@ -183,7 +206,7 @@ def ask_gemini(prompt: str, images=None) -> str:
     """Call Gemini with exponential-backoff retries on 503 and optional fallback model."""
     client = gemini_client()
     if client is None:
-        raise RuntimeError("Add your Google Gemini API key in the sidebar or Streamlit secrets.")
+        raise RuntimeError("Configure GEMINI_API_KEY in .streamlit/secrets.toml, environment variables, or Streamlit Secrets.")
 
     contents: List[Any] = [prompt]
     if images:
@@ -197,7 +220,7 @@ def ask_gemini(prompt: str, images=None) -> str:
         if is_transient_503(exc):
             raise RuntimeError(
                 f"{exc} — Your API key is valid, but `{selected_model}` is temporarily overloaded on Google's side. "
-                "Wait a moment and retry, or click 'Check API key & load models' in the sidebar to switch/add a fallback model."
+                "Wait a moment and retry, or click 'Refresh models & check API' in the sidebar to switch/add a fallback model."
             ) from exc
         raise
 
